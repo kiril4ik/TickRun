@@ -283,6 +283,9 @@ fn sync_crontab(jobs: &[Job]) -> Result<(), String> {
     if !body.is_empty() {
         body.push('\n');
     }
+    if body == existing {
+        return Ok(());
+    }
     let mut child = Command::new("crontab")
         .arg("-")
         .stdin(Stdio::piped())
@@ -348,7 +351,33 @@ fn delete_job(id: String) -> Result<(), String> {
     sync_crontab(&jobs)?;
     store_jobs(&jobs)?;
     let _ = fs::remove_file(wrapper_path(&id)?);
+    clear_job_run_files(&id)
+}
+
+fn clear_job_run_files(id: &str) -> Result<(), String> {
+    let runs_dir = app_dir()?.join("runs");
+    if runs_dir.exists() {
+        for entry in fs::read_dir(runs_dir).map_err(err)? {
+            let entry = entry.map_err(err)?;
+            if !entry.file_type().map_err(err)?.is_dir() {
+                continue;
+            }
+            let dir = entry.path();
+            let meta_path = dir.join("meta");
+            if !meta_path.exists() {
+                continue;
+            }
+            if parse_meta(&meta_path)?.get("job_id").map(String::as_str) == Some(id) {
+                fs::remove_dir_all(dir).map_err(err)?;
+            }
+        }
+    }
     Ok(())
+}
+
+#[tauri::command]
+fn clear_job_runs(id: String) -> Result<(), String> {
+    clear_job_run_files(&id)
 }
 
 #[tauri::command]
@@ -486,6 +515,7 @@ pub fn run() {
             list_jobs,
             save_job,
             delete_job,
+            clear_job_runs,
             set_job_enabled,
             run_job_now,
             list_runs,
@@ -493,4 +523,131 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running TickRun");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsString;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct TestEnvironment {
+        home: Option<OsString>,
+        path: Option<OsString>,
+        root: PathBuf,
+    }
+
+    impl Drop for TestEnvironment {
+        fn drop(&mut self) {
+            match &self.home {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+            match &self.path {
+                Some(value) => std::env::set_var("PATH", value),
+                None => std::env::remove_var("PATH"),
+            }
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn isolated_environment() -> TestEnvironment {
+        let root = std::env::temp_dir().join(format!("tickrun-test-{}", new_id()));
+        let bin = root.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let crontab = bin.join("crontab");
+        fs::write(
+            &crontab,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = \"-l\" ]; then [ -f '{state}' ] && /bin/cat '{state}'; exit 0; fi\n/bin/cat >'{state}'\necho write >>'{writes}'\n",
+                state = root.join("crontab-state").display(),
+                writes = root.join("crontab-writes").display(),
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&crontab, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let environment = TestEnvironment {
+            home: std::env::var_os("HOME"),
+            path: std::env::var_os("PATH"),
+            root: root.clone(),
+        };
+        std::env::set_var("HOME", &root);
+        std::env::set_var("PATH", &bin);
+        environment
+    }
+
+    fn sample_job(id: &str) -> Job {
+        Job {
+            id: id.into(),
+            name: "Backup".into(),
+            command: "true".into(),
+            working_dir: None,
+            schedule_kind: "recurring".into(),
+            cron: Some("0 9 * * *".into()),
+            run_at: None,
+            enabled: true,
+            created_at: "2030-01-01T08:00:00Z".into(),
+            updated_at: "2030-01-01T08:00:00Z".into(),
+        }
+    }
+
+    #[test]
+    fn deleting_a_job_removes_only_its_run_history() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _environment = isolated_environment();
+        store_jobs(&[sample_job("job-1"), sample_job("job-2")]).unwrap();
+        let runs = app_dir().unwrap().join("runs");
+        let matching = runs.join("run-1");
+        let unrelated = runs.join("run-2");
+        fs::create_dir_all(&matching).unwrap();
+        fs::create_dir_all(&unrelated).unwrap();
+        fs::write(matching.join("meta"), "job_id=job-1\n").unwrap();
+        fs::write(unrelated.join("meta"), "job_id=job-2\n").unwrap();
+
+        delete_job("job-1".into()).unwrap();
+
+        assert!(!matching.exists());
+        assert!(unrelated.exists());
+        assert_eq!(load_jobs().unwrap().len(), 1);
+        assert_eq!(load_jobs().unwrap()[0].id, "job-2");
+    }
+
+    #[test]
+    fn clearing_run_history_keeps_jobs_and_unrelated_runs() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _environment = isolated_environment();
+        store_jobs(&[sample_job("job-1"), sample_job("job-2")]).unwrap();
+        let runs = app_dir().unwrap().join("runs");
+        let matching = runs.join("run-1");
+        let unrelated = runs.join("run-2");
+        fs::create_dir_all(&matching).unwrap();
+        fs::create_dir_all(&unrelated).unwrap();
+        fs::write(matching.join("meta"), "job_id=job-1\n").unwrap();
+        fs::write(unrelated.join("meta"), "job_id=job-2\n").unwrap();
+
+        clear_job_runs("job-1".into()).unwrap();
+
+        assert!(!matching.exists());
+        assert!(unrelated.exists());
+        assert_eq!(load_jobs().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn unchanged_schedule_does_not_rewrite_crontab() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let environment = isolated_environment();
+        let job = sample_job("job-1");
+        let existing = format!("{}\n", cron_line(&job).unwrap().unwrap());
+        fs::write(environment.root.join("crontab-state"), existing).unwrap();
+
+        sync_crontab(&[job]).unwrap();
+
+        assert!(!environment.root.join("crontab-writes").exists());
+    }
 }
